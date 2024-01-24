@@ -57,6 +57,27 @@ contract StakeManager is Ownable {
         _;
     }
 
+    modifier noMigration() {
+        if (address(migration) != address(0)) {
+            revert StakeManager__PendingMigration();
+        }
+        _;
+    }
+
+    modifier onlyMigration() {
+        if (address(migration) == address(0)) {
+            revert StakeManager__NoPendingMigration();
+        }
+        _;
+    }
+
+    modifier onlyOldManager() {
+        if (msg.sender != address(oldManager)) {
+            revert StakeManager__SenderIsNotPreviousStakeManager();
+        }
+        _;
+    }
+
     constructor(address _stakedToken, address _oldManager) {
         epochs[0].startTime = block.timestamp;
         oldManager = StakeManager(_oldManager);
@@ -70,11 +91,8 @@ contract StakeManager is Ownable {
      *
      * @dev Reverts when `_time` is not in range of [MIN_LOCKUP_PERIOD, MAX_LOCKUP_PERIOD]
      */
-    function stake(uint256 _amount, uint256 _time) external onlyVault {
-        if (
-            _time > 0 &&
-            (_time < MIN_LOCKUP_PERIOD || _time > MAX_LOCKUP_PERIOD)
-        ) {
+    function stake(uint256 _amount, uint256 _time) external onlyVault noMigration {
+        if (_time > 0 && (_time < MIN_LOCKUP_PERIOD || _time > MAX_LOCKUP_PERIOD)) {
             revert StakeManager__InvalidLockupPeriod();
         }
         Account storage account = accounts[msg.sender];
@@ -89,7 +107,7 @@ contract StakeManager is Ownable {
      * Decreases balance of msg.sender;
      * @param _amount Amount of balance to be decreased
      */
-    function unstake(uint256 _amount) external onlyVault {
+    function unstake(uint256 _amount) external onlyVault noMigration {
         Account storage account = accounts[msg.sender];
         if (account.lockUntil > block.timestamp) {
             revert StakeManager__FundsLocked();
@@ -110,7 +128,7 @@ contract StakeManager is Ownable {
      * @dev Reverts when `_time` is bigger than `MAX_LOCKUP_PERIOD`
      * @dev Reverts when `_time + block.timestamp` is smaller than current lock time.
      */
-    function lock(uint256 _time) external onlyVault {
+    function lock(uint256 _time) external onlyVault noMigration {
         if (_time > MAX_LOCKUP_PERIOD) {
             revert StakeManager__InvalidLockupPeriod();
         }
@@ -123,22 +141,9 @@ contract StakeManager is Ownable {
     }
 
     /**
-     * @notice leave without processing account
-     */
-    function leave() external onlyVault {
-        if (address(migration) == address(0)) {
-            revert StakeManager__NoPendingMigration();
-        }
-        Account memory account = accounts[msg.sender];
-        delete accounts[msg.sender];
-        multiplierSupply -= account.multiplier;
-        stakeSupply -= account.balance;
-    }
-
-    /**
      * @notice Release rewards for current epoch and increase epoch.
      */
-    function executeEpoch() external {
+    function executeEpoch() external noMigration {
         processEpoch();
     }
 
@@ -160,20 +165,59 @@ contract StakeManager is Ownable {
     }
 
     /**
-     * @notice Migrate account to new manager.
+     * @notice starts migration to new StakeManager
+     * @param _migration new StakeManager
      */
+    function startMigration(StakeManager _migration) external onlyOwner noMigration {
+        processEpoch();
+        migration = _migration;
+        stakedToken.transfer(address(migration), epochReward());
+        migration.migrationInitialize(currentEpoch, multiplierSupply, stakeSupply, epochs[currentEpoch].startTime);
+    }
 
-    function migrate() external onlyVault returns (StakeManager newManager) {
-        if (address(migration) == address(0)) {
-            revert StakeManager__NoPendingMigration();
-        }
-        Account storage account = accounts[msg.sender];
-        stakedToken.approve(address(migration), account.balance);
-        migration.migrate(msg.sender, account);
+    /**
+     * @dev Callable automatically from old StakeManager.startMigration(address)
+     * @notice Initilizes migration process
+     * @param _currentEpoch epoch of old manager
+     * @param _multiplierSupply MP supply on old manager
+     * @param _stakeSupply stake supply on old manager
+     * @param _epochStartTime epoch start time of old manager
+     */
+    function migrationInitialize(
+        uint256 _currentEpoch,
+        uint256 _multiplierSupply,
+        uint256 _stakeSupply,
+        uint256 _epochStartTime
+    )
+        external
+        onlyOldManager
+    {
+        currentEpoch = _currentEpoch;
+        multiplierSupply = _multiplierSupply;
+        stakeSupply = _stakeSupply;
+        epochs[currentEpoch].startTime = _epochStartTime;
+    }
 
-        multiplierSupply -= accounts[msg.sender].multiplier;
+    /**
+     * @notice Transfer current epoch funds for migrated manager
+     */
+    function transferNonPending() external onlyMigration {
+        stakedToken.transfer(address(migration), epochReward());
+    }
+
+    /**
+     * @notice Migrate account to new manager.
+     * @param _acceptMigration true if wants to migrate, false if wants to leave
+     */
+    function migrateTo(bool _acceptMigration) external onlyVault onlyMigration returns (StakeManager newManager) {
+        uint256 increasedMP = accounts[msg.sender].multiplier;
+        processAccount(accounts[msg.sender], currentEpoch);
+        Account memory account = accounts[msg.sender];
+        increasedMP -= account.multiplier;
+        multiplierSupply -= account.multiplier;
+        stakeSupply -= account.balance;
         delete accounts[msg.sender];
-
+        migration.migrateFrom(msg.sender, _acceptMigration, account, increasedMP);
         return migration;
     }
 
@@ -182,17 +226,25 @@ contract StakeManager is Ownable {
      * @notice Migrate account from old manager
      * @param _vault Account address
      * @param _account Account data
+     * @param _acceptMigration If account should be stored or its MP/balance supply reduced
+     * @param _increasedMP amount MP increased on account after migration initialized
      */
-    function migrate(address _vault, Account memory _account) external {
-        if (msg.sender != address(oldManager)) {
-            revert StakeManager__SenderIsNotPreviousStakeManager();
+    function migrateFrom(
+        address _vault,
+        bool _acceptMigration,
+        Account memory _account,
+        uint256 _increasedMP
+    )
+        external
+        onlyOldManager
+    {
+        if (_acceptMigration) {
+            accounts[_vault] = _account;
+            multiplierSupply += _increasedMP;
+        } else {
+            multiplierSupply -= _account.multiplier;
+            stakeSupply -= _account.balance;
         }
-        stakedToken.transferFrom(
-            address(oldManager),
-            address(this),
-            _account.balance
-        );
-        accounts[_vault] = _account;
     }
 
     function calcMaxMultiplierIncrease(
@@ -215,7 +267,7 @@ contract StakeManager is Ownable {
     }
 
     function processEpoch() private {
-        if (block.timestamp >= epochEnd()) {
+        if (block.timestamp >= epochEnd() && address(migration) == address(0)) {
             //finalize current epoch
             epochs[currentEpoch].epochReward = epochReward();
             epochs[currentEpoch].totalSupply = totalSupply();
@@ -231,9 +283,6 @@ contract StakeManager is Ownable {
         uint256 _limitEpoch
     ) private {
         processEpoch();
-        if (address(migration) != address(0)) {
-            revert StakeManager__PendingMigration();
-        }
         if (_limitEpoch > currentEpoch) {
             revert StakeManager__InvalidLimitEpoch();
         }
@@ -256,7 +305,9 @@ contract StakeManager is Ownable {
             pendingReward -= userReward;
             stakedToken.transfer(account.rewardAddress, userReward);
         }
-        mintMultiplier(account, block.timestamp);
+        if (userEpoch == currentEpoch && address(migration) == address(0)) {
+            mintMultiplier(account, block.timestamp);
+        }
     }
 
     function mintMultiplier(

@@ -2,9 +2,9 @@
 
 pragma solidity ^0.8.18;
 
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {StakeVault} from "./StakeVault.sol";
+import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { StakeVault } from "./StakeVault.sol";
 
 contract StakeManager is Ownable {
     error StakeManager__SenderIsNotVault();
@@ -113,8 +113,7 @@ contract StakeManager is Ownable {
             revert StakeManager__FundsLocked();
         }
         processAccount(account, currentEpoch);
-        uint256 reducedMultiplier = (_amount * account.multiplier) /
-            account.balance;
+        uint256 reducedMultiplier = (_amount * account.multiplier) / account.balance;
         account.multiplier -= reducedMultiplier;
         account.balance -= _amount;
         multiplierSupply -= reducedMultiplier;
@@ -210,14 +209,12 @@ contract StakeManager is Ownable {
      * @param _acceptMigration true if wants to migrate, false if wants to leave
      */
     function migrateTo(bool _acceptMigration) external onlyVault onlyMigration returns (StakeManager newManager) {
-        uint256 increasedMP = accounts[msg.sender].multiplier;
         processAccount(accounts[msg.sender], currentEpoch);
         Account memory account = accounts[msg.sender];
-        increasedMP -= account.multiplier;
         multiplierSupply -= account.multiplier;
         stakeSupply -= account.balance;
         delete accounts[msg.sender];
-        migration.migrateFrom(msg.sender, _acceptMigration, account, increasedMP);
+        migration.migrateFrom(msg.sender, _acceptMigration, account);
         return migration;
     }
 
@@ -227,24 +224,23 @@ contract StakeManager is Ownable {
      * @param _vault Account address
      * @param _account Account data
      * @param _acceptMigration If account should be stored or its MP/balance supply reduced
-     * @param _increasedMP amount MP increased on account after migration initialized
      */
-    function migrateFrom(
-        address _vault,
-        bool _acceptMigration,
-        Account memory _account,
-        uint256 _increasedMP
-    )
-        external
-        onlyOldManager
-    {
+    function migrateFrom(address _vault, bool _acceptMigration, Account memory _account) external onlyOldManager {
         if (_acceptMigration) {
             accounts[_vault] = _account;
-            multiplierSupply += _increasedMP;
         } else {
             multiplierSupply -= _account.multiplier;
             stakeSupply -= _account.balance;
         }
+    }
+    /**
+     * @dev Only callable from old manager.
+     * @notice Increase total MP from old manager
+     * @param _increasedMP amount MP increased on account after migration initialized
+     */
+
+    function increaseMPFromMigration(uint256 _increasedMP) external onlyOldManager {
+        multiplierSupply += _increasedMP;
     }
 
     function calcMaxMultiplierIncrease(
@@ -252,14 +248,15 @@ contract StakeManager is Ownable {
         uint256 _currentMp,
         uint256 _lockUntil,
         uint256 _stake
-    ) private view returns (uint256 _maxToIncrease) {
+    )
+        private
+        view
+        returns (uint256 _maxToIncrease)
+    {
         uint256 newMp = _increasedMultiplier + _currentMp;
         if (block.timestamp > _lockUntil) {
             //not locked, limit to max_boost
-            return
-                newMp > _stake * MAX_BOOST
-                    ? _stake * MAX_BOOST - _currentMp
-                    : _increasedMultiplier;
+            return newMp > _stake * MAX_BOOST ? _stake * MAX_BOOST - _currentMp : _increasedMultiplier;
         } else {
             // locked, ignore cap
             return _increasedMultiplier;
@@ -278,21 +275,14 @@ contract StakeManager is Ownable {
         }
     }
 
-    function processAccount(
-        Account storage account,
-        uint256 _limitEpoch
-    ) private {
+    function processAccount(Account storage account, uint256 _limitEpoch) private {
         processEpoch();
         if (_limitEpoch > currentEpoch) {
             revert StakeManager__InvalidLimitEpoch();
         }
         uint256 userReward;
         uint256 userEpoch = account.epoch;
-        for (
-            Epoch memory iEpoch = epochs[userEpoch];
-            userEpoch < _limitEpoch;
-            userEpoch++
-        ) {
+        for (Epoch memory iEpoch = epochs[userEpoch]; userEpoch < _limitEpoch; userEpoch++) {
             //mint multipliers to that epoch
             mintMultiplier(account, iEpoch.startTime + EPOCH_SIZE);
             uint256 userSupply = account.balance + account.multiplier;
@@ -310,20 +300,17 @@ contract StakeManager is Ownable {
         }
     }
 
-    function mintMultiplier(
-        Account storage account,
-        uint256 processTime
-    ) private {
+    function mintMultiplier(Account storage account, uint256 processTime) private {
         uint256 deltaTime = processTime - account.lastMint;
         account.lastMint = processTime;
         uint256 increasedMultiplier = calcMaxMultiplierIncrease(
-            account.balance * ((MP_APY / YEAR) * deltaTime),
-            account.multiplier,
-            account.lockUntil,
-            account.balance
+            account.balance * ((MP_APY / YEAR) * deltaTime), account.multiplier, account.lockUntil, account.balance
         );
         account.multiplier += increasedMultiplier;
         multiplierSupply += increasedMultiplier;
+        if (address(migration) != address(0)) {
+            migration.increaseMPFromMigration(increasedMultiplier);
+        }
     }
 
     function mintIntialMultiplier(
@@ -331,16 +318,15 @@ contract StakeManager is Ownable {
         uint256 lockTime,
         uint256 amount,
         uint256 initMint
-    ) private {
+    )
+        private
+    {
         //if balance still locked, multipliers must be minted from difference of time.
-        uint256 dT = account.lockUntil > block.timestamp
-            ? block.timestamp + lockTime - account.lockUntil
-            : lockTime;
+        uint256 dT = account.lockUntil > block.timestamp ? block.timestamp + lockTime - account.lockUntil : lockTime;
         account.lockUntil = block.timestamp + lockTime;
         uint256 increasedMultiplier = amount * ((dT / YEAR) + initMint);
         account.lastMint = block.timestamp;
-        increasedMultiplier = account.multiplier + increasedMultiplier >
-            (account.balance * (MAX_BOOST + (dT / YEAR)))
+        increasedMultiplier = account.multiplier + increasedMultiplier > (account.balance * (MAX_BOOST + (dT / YEAR)))
             ? account.balance * (MAX_BOOST + (dT / YEAR)) - account.multiplier
             : increasedMultiplier; // checks if MPs are within (lock_time_in_years+MAX_BOOST)*stake
         multiplierSupply += increasedMultiplier;

@@ -147,3 +147,36 @@ rule whoChangeERC20Balance(  method f ) filtered { f -> f.contract != staked }
   f(e,args);
   assert before == staked.balanceOf(user);
 }
+
+rule epochOnlyIncreases {
+  method f;
+  env e;
+  calldataarg args;
+
+  uint256 epochBefore = currentContract.currentEpoch;
+
+  f(e, args);
+
+  assert currentContract.currentEpoch >= epochBefore;
+}
+
+
+//TODO codehash / isVault
+/*
+ghost mapping(address => bytes32) codehash;
+
+hook EXTCODEHASH(address a) bytes32 hash {
+    require hash == codehash[a];
+}
+
+rule checksCodeHash(method f) filtered {
+  f -> requiresVault(f)
+} {
+  env e;
+
+  bool isWhitelisted = isVault(codehash[e.msg.sender]);
+  f(e);
+
+  assert isWhitelisted;
+}
+*/
